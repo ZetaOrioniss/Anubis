@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+"""
+anubis — Web directory enumeration console
+Style: same aesthetic as revshell / hostsctl (ANSI, readline, shlex).
+Pure stdlib — no external dependencies.
+"""
 
 import os
 import re
@@ -17,7 +22,6 @@ import json
 import datetime
 from pathlib import Path
 from dataclasses import dataclass, field
-from collections import defaultdict
 
 
 # ─────────────────────────────────────────────
@@ -25,16 +29,16 @@ from collections import defaultdict
 # ─────────────────────────────────────────────
 
 class C:
-    RED    = "\033[91m"
-    GREEN  = "\033[92m"
-    YELLOW = "\033[93m"
-    BLUE   = "\033[94m"
-    CYAN   = "\033[96m"
-    MAGENTA= "\033[95m"
-    WHITE  = "\033[97m"
-    BOLD   = "\033[1m"
-    DIM    = "\033[2m"
-    END    = "\033[0m"
+    RED     = "\033[91m"
+    GREEN   = "\033[92m"
+    YELLOW  = "\033[93m"
+    BLUE    = "\033[94m"
+    CYAN    = "\033[96m"
+    MAGENTA = "\033[95m"
+    WHITE   = "\033[97m"
+    BOLD    = "\033[1m"
+    DIM     = "\033[2m"
+    END     = "\033[0m"
 
     @staticmethod
     def r(s):    return f"{C.RED}{s}{C.END}"
@@ -58,21 +62,22 @@ class C:
 #  Constants & defaults
 # ─────────────────────────────────────────────
 
-OUTPUT_DIR   = Path(os.path.expanduser("~/.anubis/results"))
+OUTPUT_DIR         = Path(os.path.expanduser("~/.anubis/results"))
 DEFAULT_THREADS    = 20
-DEFAULT_TIMEOUT    = 6        # seconds per request
-DEFAULT_DELAY      = 0.0      # seconds between requests per thread
+DEFAULT_TIMEOUT    = 6
+DEFAULT_DELAY      = 0.0
 DEFAULT_EXTENSIONS = []
 DEFAULT_STATUS_OK  = {200, 204, 301, 302, 307, 308, 401, 403}
-USER_AGENT   = "Mozilla/5.0 (anubis/1.0; CTF-scanner)"
+USER_AGENT         = "Mozilla/5.0 (anubis/1.0; CTF-scanner)"
 
-# Colour map per HTTP status family
-STATUS_COLOR = {
-    2: C.GREEN,
-    3: C.CYAN,
-    4: C.YELLOW,
-    5: C.RED,
-}
+STATUS_COLOR = {2: C.GREEN, 3: C.CYAN, 4: C.YELLOW, 5: C.RED}
+
+# Terminal width (fallback 100)
+try:
+    TERM_W = os.get_terminal_size().columns
+except OSError:
+    TERM_W = 100
+
 
 # ─────────────────────────────────────────────
 #  Data structures
@@ -86,19 +91,20 @@ class Hit:
     redirect:   str = ""
     elapsed_ms: int = 0
 
+
 @dataclass
 class ScanConfig:
-    target:     str   = ""
-    wordlist:   str   = ""
-    threads:    int   = DEFAULT_THREADS
-    timeout:    int   = DEFAULT_TIMEOUT
-    delay:      float = DEFAULT_DELAY
-    extensions: list  = field(default_factory=list)
-    status_ok:  set   = field(default_factory=lambda: set(DEFAULT_STATUS_OK))
-    recursive:  bool  = True    # auto-pivot on hits
-    max_depth:  int   = 3
-    user_agent: str   = USER_AGENT
-    follow_redirect: bool = False
+    target:          str   = ""
+    wordlist:        str   = ""
+    threads:         int   = DEFAULT_THREADS
+    timeout:         int   = DEFAULT_TIMEOUT
+    delay:           float = DEFAULT_DELAY
+    extensions:      list  = field(default_factory=list)
+    status_ok:       set   = field(default_factory=lambda: set(DEFAULT_STATUS_OK))
+    recursive:       bool  = True
+    max_depth:       int   = 3
+    user_agent:      str   = USER_AGENT
+    follow_redirect: bool  = False
 
     def is_ready(self) -> tuple[bool, str]:
         if not self.target:
@@ -111,18 +117,185 @@ class ScanConfig:
 
 
 # ─────────────────────────────────────────────
-#  Print lock (thread-safe output)
+#  Display manager
+#
+#  Single source of truth for stdout during a scan.
+#  Workers push Hit objects into _hit_q.
+#  The renderer thread:
+#    1. erases the progress bar line
+#    2. prints any pending hits (clean, above the bar)
+#    3. redraws the progress bar on the last line
+#  No other thread ever writes to stdout directly.
 # ─────────────────────────────────────────────
 
-_print_lock = threading.Lock()
+class DisplayManager:
+    # ANSI helpers
+    ERASE_LINE  = "\r\033[2K"
+    CURSOR_UP   = "\033[1A"
+    HIDE_CURSOR = "\033[?25l"
+    SHOW_CURSOR = "\033[?25h"
 
-def tprint(*args, **kwargs):
-    with _print_lock:
-        print(*args, **kwargs)
+    def __init__(self, total: int, base_url: str):
+        self.total    = total
+        self.base_url = base_url
 
-def erase_line():
-    sys.stdout.write("\r\033[2K")
-    sys.stdout.flush()
+        # stats (written by workers, read by renderer)
+        self._done   = 0
+        self._hits   = 0
+        self._errors = 0
+        self._skip   = 0
+        self._start  = time.time()
+        self._lock   = threading.Lock()
+
+        # hit queue: workers push Hit objects here
+        self._hit_q: queue.Queue = queue.Queue()
+
+        # renderer state
+        self._bar_visible  = False   # is the progress bar currently on screen?
+        self._current_url  = ""
+        self._stop_render  = threading.Event()
+        self._render_thread = threading.Thread(
+            target=self._render_loop, daemon=True
+        )
+        self._render_thread.start()
+
+    # ── called by workers ────────────────────────────────────────────────
+
+    def tick(self, url: str, is_hit: bool = False,
+             is_error: bool = False, is_skip: bool = False,
+             hit: "Hit | None" = None):
+        with self._lock:
+            self._done  += 1
+            if is_hit:   self._hits   += 1
+            if is_error: self._errors += 1
+            if is_skip:  self._skip   += 1
+            self._current_url = url
+
+        if hit is not None:
+            self._hit_q.put(hit)
+
+    # ── renderer thread ──────────────────────────────────────────────────
+
+    def _render_loop(self):
+        sys.stdout.write(self.HIDE_CURSOR)
+        sys.stdout.flush()
+        while not self._stop_render.is_set():
+            self._flush()
+            time.sleep(0.08)          # ~12 fps — smooth without burning CPU
+        self._flush(final=True)       # drain remaining hits after scan ends
+        sys.stdout.write(self.SHOW_CURSOR)
+        sys.stdout.flush()
+
+    def _flush(self, final: bool = False):
+        pending: list[Hit] = []
+        try:
+            while True:
+                pending.append(self._hit_q.get_nowait())
+        except queue.Empty:
+            pass
+
+        with self._lock:
+            done   = self._done
+            hits   = self._hits
+            errors = self._errors
+            skip   = self._skip
+            url    = self._current_url
+
+        has_output = bool(pending)
+
+        if has_output or not final:
+            # Erase progress bar if it was drawn
+            if self._bar_visible:
+                sys.stdout.write(self.ERASE_LINE)
+
+            # Print each pending hit on its own clean line
+            for h in pending:
+                family    = h.status // 100
+                sc        = STATUS_COLOR.get(family, C.WHITE)
+                redir_str = (f"  {C.dim('→')} {C.dim(h.redirect[:55])}"
+                             if h.redirect else "")
+
+                # Status badge + URL + size + time
+                badge = f"{sc}{C.BOLD}[{h.status}]{C.END}"
+                url_s = h.url
+                meta  = (f"{C.dim(f'{h.size:>8} B')}  "
+                         f"{C.dim(f'{h.elapsed_ms}ms')}")
+
+                # Truncate URL if too long for terminal
+                max_url = TERM_W - 30
+                if len(url_s) > max_url:
+                    url_s = "…" + url_s[-(max_url - 1):]
+
+                sys.stdout.write(
+                    f"  {badge}  {C.bold(url_s)}  {meta}{redir_str}\n"
+                )
+
+            # Redraw the progress bar (unless final flush)
+            if not final:
+                bar_str = self._build_bar(done, hits, errors, url)
+                sys.stdout.write(bar_str)
+                self._bar_visible = True
+            else:
+                self._bar_visible = False
+
+            sys.stdout.flush()
+
+    def _build_bar(self, done: int, hits: int, errors: int,
+                   current_url: str) -> str:
+        elapsed = time.time() - self._start
+        rps     = done / elapsed if elapsed > 0 else 0
+        pct     = done / self.total * 100 if self.total else 0
+        bar_w   = 28
+        filled  = int(bar_w * done / self.total) if self.total else 0
+        bar     = C.g("\u2588" * filled) + C.dim("\u2591" * (bar_w - filled))
+        eta     = int((self.total - done) / rps) if rps > 0 else 0
+
+        # Right side: trim current URL to fit
+        right   = (f"  {C.dim(f'{done}/{self.total}')}  "
+                   f"{C.g(f'+{hits}')}  "
+                   f"{C.dim(f'{rps:.0f} r/s')}  "
+                   f"ETA {C.y(f'{eta}s')}")
+
+        # Current URL — what's being scanned right now
+        # Strip base URL prefix to keep it short
+        short = current_url.replace(self.base_url, "")
+        if not short:
+            short = current_url
+        max_path = max(10, TERM_W - bar_w - 60)
+        if len(short) > max_path:
+            short = "…" + short[-(max_path - 1):]
+
+        return (f"\r  {bar}  {C.bold(f'{pct:5.1f}%')}"
+                f"{right}  {C.dim(short)}")
+
+    # ── called after all threads finish ──────────────────────────────────
+
+    def stop(self) -> dict:
+        self._stop_render.set()
+        self._render_thread.join(timeout=2)
+        # Final clean newline after progress bar area
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        elapsed = time.time() - self._start
+        with self._lock:
+            return {
+                "hits":    self._hits,
+                "errors":  self._errors,
+                "skip":    self._skip,
+                "done":    self._done,
+                "elapsed": elapsed,
+            }
+
+
+# ─────────────────────────────────────────────
+#  Progress (thin wrapper kept for compat)
+# ─────────────────────────────────────────────
+
+class Progress:
+    """Legacy stub — stats now live in DisplayManager."""
+    def __init__(self):
+        self.hits = self.errors = self.skip = self.done = 0
+        self._start = time.time()
 
 
 # ─────────────────────────────────────────────
@@ -132,31 +305,37 @@ def erase_line():
 def make_request(url: str, cfg: ScanConfig) -> tuple[int, int, str]:
     """
     Returns (status_code, content_length, redirect_url).
-    Returns (-1, 0, "") on network error.
+      -1  : network / connection error
+      -2  : invalid URL (spaces, non-ASCII) — silently skipped
     """
     try:
         req = urllib.request.Request(url, headers={"User-Agent": cfg.user_agent})
         with urllib.request.urlopen(req, timeout=cfg.timeout) as resp:
-            body   = resp.read()
-            status = resp.status
-            redir  = resp.url if resp.url != url else ""
-            return status, len(body), redir
+            body  = resp.read()
+            redir = resp.url if resp.url != url else ""
+            return resp.status, len(body), redir
+
     except urllib.error.HTTPError as e:
-        # HTTPError is still a valid response (4xx / 5xx)
         try:
             body = e.read()
         except Exception:
             body = b""
-        redir = e.headers.get("Location", "")
+        redir = e.headers.get("Location", "") if e.headers else ""
         return e.code, len(body), redir
+
     except urllib.error.URLError:
         return -1, 0, ""
+
     except (http.client.RemoteDisconnected,
             http.client.IncompleteRead,
             ConnectionResetError,
             socket.timeout,
             OSError):
         return -1, 0, ""
+
+    except (http.client.InvalidURL, UnicodeEncodeError,
+            UnicodeDecodeError, ValueError):
+        return -2, 0, ""
 
 
 # ─────────────────────────────────────────────
@@ -172,61 +351,21 @@ def load_wordlist(path: str) -> list[str]:
                 if line and not line.startswith("#"):
                     words.append(line)
     except Exception as e:
-        tprint(C.r(f"  [-] Cannot read wordlist: {e}"))
+        print(C.r(f"  [-] Cannot read wordlist: {e}"))
     return words
 
 
+def _encode_word(word: str) -> str:
+    return urllib.parse.quote(word, safe="/:@!$&'()*+,;=-._~")
+
+
 def build_urls(base: str, word: str, extensions: list[str]) -> list[str]:
-    """
-    Generate all URL variants for a word:
-    base/word  +  base/word.ext for each extension.
-    """
-    base = base.rstrip("/")
-    word = word.lstrip("/")
-    urls = [f"{base}/{word}"]
+    base         = base.rstrip("/")
+    word_encoded = _encode_word(word.lstrip("/"))
+    urls = [f"{base}/{word_encoded}"]
     for ext in extensions:
-        ext = ext.lstrip(".")
-        urls.append(f"{base}/{word}.{ext}")
+        urls.append(f"{base}/{word_encoded}.{ext.lstrip('.')}")
     return urls
-
-
-# ─────────────────────────────────────────────
-#  Progress bar
-# ─────────────────────────────────────────────
-
-class Progress:
-    def __init__(self, total: int):
-        self.total    = total
-        self.done     = 0
-        self.hits     = 0
-        self.errors   = 0
-        self._lock    = threading.Lock()
-        self._start   = time.time()
-
-    def tick(self, is_hit: bool = False, is_error: bool = False):
-        with self._lock:
-            self.done  += 1
-            if is_hit:   self.hits   += 1
-            if is_error: self.errors += 1
-
-    def render(self, current_url: str = "") -> str:
-        elapsed = time.time() - self._start
-        rps     = self.done / elapsed if elapsed > 0 else 0
-        pct     = self.done / self.total * 100 if self.total else 0
-        bar_w   = 24
-        filled  = int(bar_w * self.done / self.total) if self.total else 0
-        bar     = C.g("█" * filled) + C.dim("░" * (bar_w - filled))
-        eta     = int((self.total - self.done) / rps) if rps > 0 else 0
-
-        short_url = current_url[-42:] if len(current_url) > 42 else current_url
-        short_url = short_url.ljust(42)
-
-        return (f"\r  {bar} {C.bold(f'{pct:5.1f}%')} "
-                f"{C.dim(f'{self.done}/{self.total}')} "
-                f"{C.g(f'↑{self.hits}')} "
-                f"{C.dim(f'{rps:.0f}r/s')} "
-                f"ETA:{C.y(f'{eta}s')} "
-                f"{C.dim(short_url)}")
 
 
 # ─────────────────────────────────────────────
@@ -252,7 +391,6 @@ class ResultStore:
                 "redirect":   hit.redirect,
                 "elapsed_ms": hit.elapsed_ms,
             })
-            # Append text line immediately
             with open(self.txt, "a") as f:
                 redir = f" -> {hit.redirect}" if hit.redirect else ""
                 f.write(f"[{hit.status}] {hit.url}  ({hit.size}B){redir}\n")
@@ -263,7 +401,7 @@ class ResultStore:
                 json.dump({
                     "meta": {
                         "generated": datetime.datetime.now().isoformat(),
-                        "count": len(self._hits),
+                        "count":     len(self._hits),
                     },
                     "hits": self._hits,
                 }, f, indent=2)
@@ -279,14 +417,14 @@ class ResultStore:
 
 class Scanner:
     def __init__(self, cfg: ScanConfig):
-        self.cfg    = cfg
-        self._stop  = threading.Event()
+        self.cfg   = cfg
+        self._stop = threading.Event()
 
     def stop(self):
         self._stop.set()
 
     def _worker(self, q: queue.Queue, store: ResultStore,
-                progress: Progress, pivot_queue: queue.Queue | None):
+                dm: DisplayManager, pivot_queue: "queue.Queue | None"):
         while not self._stop.is_set():
             try:
                 url = q.get(timeout=0.3)
@@ -302,79 +440,59 @@ class Scanner:
 
             is_hit   = status in self.cfg.status_ok
             is_error = status == -1
+            is_skip  = status == -2
 
-            progress.tick(is_hit=is_hit, is_error=is_error)
-
+            hit_obj: Hit | None = None
             if is_hit:
-                hit = Hit(url=url, status=status, size=size,
-                          redirect=redir, elapsed_ms=elapsed)
-                store.add(hit)
+                hit_obj = Hit(url=url, status=status, size=size,
+                              redirect=redir, elapsed_ms=elapsed)
+                store.add(hit_obj)
 
-                # Status colour
-                family = status // 100
-                sc     = STATUS_COLOR.get(family, C.WHITE)
-
-                erase_line()
-                redir_str = f"  {C.dim('->')} {C.dim(redir[:60])}" if redir else ""
-                tprint(
-                    f"  {sc}{C.BOLD}[{status}]{C.END} "
-                    f"{C.bold(url):<72} "
-                    f"{C.dim(f'{size:>8} B')} "
-                    f"{C.dim(f'{elapsed}ms')}"
-                    f"{redir_str}"
-                )
-
-                # Pivot: if it's a directory-like hit, enqueue for recursive scan
+                # Auto-pivot on directory-like 2xx/3xx
                 if pivot_queue and self.cfg.recursive:
-                    # Only pivot on 2xx / 3xx and if URL looks like a directory
+                    family = status // 100
                     if family in (2, 3) and not re.search(r"\.\w{1,6}$", url):
                         pivot_queue.put(url)
 
-            # Update progress bar (throttled to avoid I/O spam)
-            if progress.done % 5 == 0 or is_hit:
-                with _print_lock:
-                    sys.stdout.write(progress.render(url))
-                    sys.stdout.flush()
+            dm.tick(url, is_hit=is_hit, is_error=is_error,
+                    is_skip=is_skip, hit=hit_obj)
 
             q.task_done()
 
     def scan_base(self, base_url: str, words: list[str],
                   store: ResultStore, depth: int = 0,
-                  pivot_queue: queue.Queue | None = None) -> list[Hit]:
-        """
-        Scan base_url with the given words.
-        Returns list of hits.
-        """
+                  pivot_queue: "queue.Queue | None" = None) -> list[dict]:
         if self._stop.is_set() or depth > self.cfg.max_depth:
             return []
 
-        # Build full URL list
-        urls = []
+        urls: list[str] = []
         for word in words:
             urls.extend(build_urls(base_url, word, self.cfg.extensions))
 
-        total    = len(urls)
-        progress = Progress(total)
-        work_q   = queue.Queue()
+        total = len(urls)
+        W     = min(TERM_W, 100)
+
+        # ── scan header ──────────────────────────────────────────────────
+        depth_label = f"  {C.dim('depth ' + str(depth))}" if depth > 0 else ""
+        print(f"\n{C.BOLD}{C.YELLOW}{'─' * W}{C.END}")
+        print(f"  {C.BOLD}{C.YELLOW}SCANNING{C.END}  {C.c(base_url)}{depth_label}")
+        print(f"  {C.dim(str(total) + ' URLs')}  "
+              f"{C.dim('·')}  {C.dim(str(self.cfg.threads) + ' threads')}  "
+              f"{C.dim('·')}  {C.dim('timeout ' + str(self.cfg.timeout) + 's')}  "
+              f"{C.dim('·')}  {C.dim('delay ' + str(self.cfg.delay) + 's')}")
+        print(f"{C.BOLD}{C.YELLOW}{'─' * W}{C.END}\n")
+
+        dm     = DisplayManager(total, base_url)
+        work_q: queue.Queue = queue.Queue()
         for u in urls:
             work_q.put(u)
 
-        W = 80
-        depth_label = f"  depth {depth}" if depth > 0 else ""
-        tprint(f"\n{C.BOLD}{C.YELLOW}{'═' * W}{C.END}")
-        tprint(f"{C.BOLD}{C.YELLOW}  SCANNING{C.END}  {C.c(base_url)}{C.dim(depth_label)}")
-        tprint(f"  {C.dim(f'{total} URLs')}  ·  "
-               f"{C.dim(f'{self.cfg.threads} threads')}  ·  "
-               f"{C.dim(f'timeout {self.cfg.timeout}s')}  ·  "
-               f"{C.dim(f'delay {self.cfg.delay}s/thread')}")
-        tprint(f"{C.BOLD}{C.YELLOW}{'─' * W}{C.END}\n")
-
-        threads = []
+        threads   = []
         n_threads = min(self.cfg.threads, total)
         for _ in range(n_threads):
             t = threading.Thread(
                 target=self._worker,
-                args=(work_q, store, progress, pivot_queue),
+                args=(work_q, store, dm, pivot_queue),
                 daemon=True,
             )
             t.start()
@@ -383,37 +501,40 @@ class Scanner:
         for t in threads:
             t.join()
 
-        erase_line()
-        elapsed = time.time() - progress._start
-        tprint(
-            f"\n  {C.bold('Done:')} "
-            f"{C.g(str(progress.hits))} hits  "
-            f"{C.dim(str(progress.errors))} errors  "
-            f"{C.dim(f'{progress.done} requests in {elapsed:.1f}s')}\n"
-        )
+        stats = dm.stop()
+
+        # ── scan footer ──────────────────────────────────────────────────
+        elapsed = stats["elapsed"]
+        rps     = stats["done"] / elapsed if elapsed > 0 else 0
+        print(f"\n  {C.dim('─' * (W - 4))}")
+        print(f"  {C.bold('hits')}    {C.g(str(stats['hits']))}")
+        print(f"  {C.bold('errors')}  {C.dim(str(stats['errors']))}")
+        print(f"  {C.bold('skipped')} {C.dim(str(stats['skip']))}")
+        print(f"  {C.bold('total')}   {C.dim(str(stats['done']) + ' requests')}"
+              f"  {C.dim('in ' + f'{elapsed:.1f}s')}  "
+              f"{C.dim(f'({rps:.0f} r/s)')}")
+        print(f"  {C.dim('─' * (W - 4))}\n")
+
         return store.hits()
 
     def run(self, words: list[str]) -> ResultStore:
-        store      = ResultStore(self.cfg.target)
+        store   = ResultStore(self.cfg.target)
         pivot_q: queue.Queue = queue.Queue()
 
-        # Initial scan
         self.scan_base(self.cfg.target, words, store, depth=0,
                        pivot_queue=pivot_q)
 
-        # Recursive pivot loop
         if self.cfg.recursive:
             visited = {self.cfg.target.rstrip("/")}
             depth   = 1
             while not self._stop.is_set() and depth <= self.cfg.max_depth:
-                pivots = []
+                pivots: list[str] = []
                 try:
                     while True:
                         pivots.append(pivot_q.get_nowait())
                 except queue.Empty:
                     pass
 
-                # Deduplicate
                 new_pivots = [p.rstrip("/") for p in pivots
                               if p.rstrip("/") not in visited]
                 if not new_pivots:
@@ -423,15 +544,18 @@ class Scanner:
                     visited.add(pivot)
                     if self._stop.is_set():
                         break
-                    tprint(f"\n  {C.y('↪')} {C.bold('Pivoting into:')} {C.c(pivot)}")
+                    print(f"\n  {C.y('↪')}  {C.bold('Pivoting into:')}  {C.c(pivot)}\n")
                     self.scan_base(pivot, words, store, depth=depth,
                                    pivot_queue=pivot_q)
                 depth += 1
 
         store.save()
-        tprint(f"  {C.g('✔')}  Results saved:")
-        tprint(f"     JSON: {C.bold(str(store.path))}")
-        tprint(f"     TXT:  {C.bold(str(store.txt))}\n")
+        W = min(TERM_W, 100)
+        print(f"{C.BOLD}{C.YELLOW}{'═' * W}{C.END}")
+        print(f"  {C.g('✔')}  Scan complete — results saved")
+        print(f"     {C.dim('JSON')}  {C.bold(str(store.path))}")
+        print(f"     {C.dim('TXT ')}  {C.bold(str(store.txt))}")
+        print(f"{C.BOLD}{C.YELLOW}{'═' * W}{C.END}\n")
         return store
 
 
@@ -442,8 +566,8 @@ class Scanner:
 class Session:
     def __init__(self):
         self.cfg: ScanConfig = ScanConfig()
-        self._scanner: Scanner | None = None
-        self._scan_thread: threading.Thread | None = None
+        self._scanner: "Scanner | None" = None
+        self._scan_thread: "threading.Thread | None" = None
 
     def is_running(self) -> bool:
         return (self._scan_thread is not None
@@ -452,23 +576,25 @@ class Session:
     def start_scan(self):
         ok, err = self.cfg.is_ready()
         if not ok:
-            tprint(C.r(f"  [-] {err}"))
+            print(C.r(f"  [-] {err}"))
             return
 
         words = load_wordlist(self.cfg.wordlist)
         if not words:
-            tprint(C.r("  [-] Wordlist is empty or unreadable."))
+            print(C.r("  [-] Wordlist is empty or unreadable."))
             return
 
-        tprint(f"\n  {C.dim('Wordlist:')} {C.g(str(len(words)))} words  ·  "
-               f"{C.dim('Extensions:')} {C.g(', '.join(self.cfg.extensions) or 'none')}  ·  "
-               f"{C.dim('Recursive:')} {C.g(str(self.cfg.recursive))} "
-               f"{C.dim('(max depth ' + str(self.cfg.max_depth) + ')')}")
+        exts   = ", ".join(self.cfg.extensions) or "none"
+        depth  = str(self.cfg.max_depth)
+        print(f"\n  {C.dim('Wordlist:')}    {C.g(str(len(words)))} words")
+        print(f"  {C.dim('Extensions:')}  {C.g(exts)}")
+        print(f"  {C.dim('Recursive:')}   {C.g(str(self.cfg.recursive))}"
+              f"  {C.dim('(max depth ' + depth + ')')}\n")
 
         self._scanner = Scanner(self.cfg)
 
         def _run():
-            self._scanner.run(words)
+            self._scanner.run(words)  # type: ignore[union-attr]
 
         self._scan_thread = threading.Thread(target=_run, daemon=True)
         self._scan_thread.start()
@@ -476,84 +602,101 @@ class Session:
     def stop_scan(self):
         if self._scanner:
             self._scanner.stop()
-            tprint(C.y("  [!] Scan stop requested — waiting for threads..."))
+            print(C.y("  [!] Scan stop requested — waiting for threads..."))
             if self._scan_thread:
                 self._scan_thread.join(timeout=5)
-            tprint(C.dim("  Scan stopped."))
+            print(C.dim("  Scan stopped.\n"))
 
 
 # ─────────────────────────────────────────────
-#  Display helpers
+#  Display helpers (static tables)
 # ─────────────────────────────────────────────
 
-W = 80
+W_STATIC = 80
 
-def hr(char="─", color=C.YELLOW) -> str:
-    return f"{C.BOLD}{color}{char * W}{C.END}"
+
+def hr(char="-", color=C.YELLOW, w=W_STATIC) -> str:
+    return f"{C.BOLD}{color}{char * w}{C.END}"
 
 
 def print_options(cfg: ScanConfig):
-    def row(k, v, note=""): 
+    def row(k, v, note=""):
         vc = C.g(str(v)) if v else C.r("not set")
-        tprint(f"  {C.bold(k):<{14 + len(C.BOLD) + len(C.END)}}{vc}  {C.dim(note)}")
+        print(f"  {C.bold(k):<{16 + len(C.BOLD) + len(C.END)}}{vc}  {C.dim(note)}")
 
-    tprint(f"\n{hr('─')}")
-    tprint(f"  {C.bold('OPTION'):<{14 + len(C.BOLD) + len(C.END)}}{C.bold('VALUE')}")
-    tprint(hr("─", C.DIM))
-    row("target",     cfg.target,        "URL to enumerate")
-    row("wordlist",   cfg.wordlist,       "path to wordlist file")
-    row("threads",    cfg.threads,        "concurrent workers")
-    row("timeout",    f"{cfg.timeout}s",  "request timeout")
-    row("delay",      f"{cfg.delay}s",    "delay per thread between requests")
+    print(f"\n{hr()}")
+    print(f"  {C.bold('OPTION'):<{16 + len(C.BOLD) + len(C.END)}}{C.bold('VALUE')}")
+    print(hr(color=C.DIM))
+    row("target",     cfg.target,          "URL to enumerate")
+    row("wordlist",   cfg.wordlist,         "path to wordlist file")
+    row("threads",    cfg.threads,          "concurrent workers")
+    row("timeout",    f"{cfg.timeout}s",    "request timeout")
+    row("delay",      f"{cfg.delay}s",      "delay per thread between requests")
     row("extensions", ", ".join(cfg.extensions) or "none", "e.g. php,html,txt")
-    row("status",     ", ".join(str(s) for s in sorted(cfg.status_ok)), "codes considered as hits")
-    row("recursive",  cfg.recursive,      f"auto-pivot on hits (max depth {cfg.max_depth})")
-    row("max_depth",  cfg.max_depth,      "pivot recursion limit")
-    row("useragent",  cfg.user_agent[:50],"")
-    tprint(hr("─"))
-    tprint()
+    row("status",     ", ".join(str(s) for s in sorted(cfg.status_ok)),
+        "codes considered as hits")
+    row("recursive",  cfg.recursive,
+        f"auto-pivot on hits (max depth {cfg.max_depth})")
+    row("max_depth",  cfg.max_depth,        "pivot recursion limit")
+    row("useragent",  cfg.user_agent[:48],  "")
+    print(hr())
+    print()
 
 
 def print_results_table(hits: list[dict]):
     if not hits:
-        tprint(C.dim("  No hits recorded."))
+        print(C.dim("  No hits recorded."))
         return
 
-    tprint(f"\n{hr('═')}")
-    tprint(f"{C.BOLD}{C.YELLOW}  RESULTS — {len(hits)} hits{C.END}")
-    tprint(hr("═"))
-    tprint(f"  {C.bold('STATUS'):<{10 + len(C.BOLD) + len(C.END)}}"
-           f"{C.bold('SIZE'):>10}  "
-           f"{C.bold('URL')}")
-    tprint(hr("─", C.DIM))
+    # Dynamic column widths
+    max_url = max((len(h["url"]) for h in hits), default=30)
+    max_url = min(max_url, TERM_W - 32)
+
+    print(f"\n{hr('=')}")
+    print(f"{C.BOLD}{C.YELLOW}  RESULTS  —  {len(hits)} hits{C.END}")
+    print(hr("="))
+    print(f"  {C.bold('STATUS'):<{10 + len(C.BOLD) + len(C.END)}}"
+          f"  {C.bold('SIZE'):>10}  "
+          f"  {C.bold('TIME'):>8}  "
+          f"  {C.bold('URL')}")
+    print(hr(color=C.DIM))
+
     for h in hits:
         family = h["status"] // 100
         sc     = STATUS_COLOR.get(family, C.WHITE)
-        redir  = f"  {C.dim('->')} {C.dim(h['redirect'][:50])}" if h.get("redirect") else ""
-        tprint(f"  {sc}{C.BOLD}[{h['status']}]{C.END}  "
-               f"{C.dim(str(h['size']) + ' B'):>12}  "
-               f"{h['url']}{redir}")
-    tprint(hr("═"))
-    tprint()
+        redir  = (f"  {C.dim('→')} {C.dim(h['redirect'][:50])}"
+                  if h.get("redirect") else "")
+        url_s  = h["url"]
+        if len(url_s) > max_url:
+            url_s = "…" + url_s[-(max_url - 1):]
+        print(f"  {sc}{C.BOLD}[{h['status']}]{C.END}"
+              f"  {C.dim(str(h['size']) + ' B'):>12}"
+              f"  {C.dim(str(h.get('elapsed_ms', 0)) + 'ms'):>9}"
+              f"  {url_s}{redir}")
+
+    print(hr("="))
+    print()
 
 
 def list_past_results():
     if not OUTPUT_DIR.exists():
-        tprint(C.dim("  No results found."))
+        print(C.dim("  No results found."))
         return
     files = sorted(OUTPUT_DIR.glob("*.txt"), reverse=True)
     if not files:
-        tprint(C.dim("  No result files found."))
+        print(C.dim("  No result files found."))
         return
-    tprint(f"\n{hr('─')}")
-    tprint(f"  {C.bold('PAST SCANS')}  {C.dim(str(OUTPUT_DIR))}")
-    tprint(hr("─", C.DIM))
+    print(f"\n{hr()}")
+    print(f"  {C.bold('PAST SCANS')}  {C.dim(str(OUTPUT_DIR))}")
+    print(hr(color=C.DIM))
     for i, f in enumerate(files[:20], 1):
-        sz = f.stat().st_size
-        tprint(f"  {C.dim(str(i) + '.'):<{5 + len(C.DIM) + len(C.END)}}"
-               f"{C.g(f.name):<60}{C.dim(str(sz) + ' B')}")
-    tprint(hr("─"))
-    tprint()
+        sz  = f.stat().st_size
+        idx = f"{C.dim(str(i) + '.')}"
+        print(f"  {idx:<{4 + len(C.DIM) + len(C.END)}}"
+              f"  {C.g(f.name):<56}"
+              f"  {C.dim(str(sz) + ' B')}")
+    print(hr())
+    print()
 
 
 # ─────────────────────────────────────────────
@@ -562,6 +705,7 @@ def list_past_results():
 
 BANNER = f"""
 {C.BOLD}{C.WHITE}
+
    ▄████████ ███▄▄▄▄   ███    █▄  ▀█████████▄   ▄█     ▄████████ 
   ███    ███ ███▀▀▀██▄ ███    ███   ███    ███ ███    ███    ███ 
   ███    ███ ███   ███ ███    ███   ███    ███ ███▌   ███    █▀  
@@ -570,12 +714,12 @@ BANNER = f"""
   ███    ███ ███   ███ ███    ███   ███    ██▄ ███           ███ 
   ███    ███ ███   ███ ███    ███   ███    ███ ███     ▄█    ███ 
   ███    █▀   ▀█   █▀  ████████▀  ▄█████████▀  █▀    ▄████████▀  
+
 {C.END}{C.DIM}
-  Web Directory Enumeration Console  •  CTF Edition{C.END}
-{C.END}{C.DIM}  Author: {C.BOLD}{C.WHITE}@ZetaOrioniss{C.END}
-{C.END}{C.DIM}  Version: {C.BOLD}{C.WHITE}v1.0{C.END}
+  Web Directory Enumeration Console  ·  CTF Edition{C.END}
+{C.DIM}  Author: {C.BOLD}{C.WHITE}@ZetaOrioniss{C.END}   {C.DIM}Version: {C.BOLD}{C.WHITE}v1.1{C.END}
 {C.DIM}
-  Results saved in: {C.END}{C.BOLD}{str(OUTPUT_DIR)}{C.END}
+  Results: {C.END}{C.BOLD}{str(OUTPUT_DIR)}{C.END}
 {C.DIM}  Type {C.END}{C.BOLD}help{C.END}{C.DIM} to list available commands.{C.END}
 """
 
@@ -591,7 +735,7 @@ HELP = f"""
   {C.g('set threads <n>')}            Worker threads  (default: {DEFAULT_THREADS})
   {C.g('set timeout <s>')}            Request timeout in seconds  (default: {DEFAULT_TIMEOUT})
   {C.g('set delay <s>')}              Delay per thread between requests  (default: 0)
-  {C.g('set extensions <a,b,…>')}     File extensions to append  (e.g. php,html,txt)
+  {C.g('set extensions <a,b,...>')}   File extensions to append  (e.g. php,html,txt)
   {C.g('set status <codes>')}         Hit status codes  (default: 200,204,301,302,307,308,401,403)
   {C.g('set recursive <true|false>')} Auto-pivot on directory hits  (default: true)
   {C.g('set depth <n>')}              Max recursion depth  (default: 3)
@@ -632,8 +776,7 @@ BOOL_OPTS = ["true", "false"]
 
 
 def _wordlist_complete(text: str) -> list[str]:
-    """File path completion for the wordlist key."""
-    d = os.path.dirname(text) or "."
+    d    = os.path.dirname(text) or "."
     base = os.path.basename(text)
     try:
         entries = os.listdir(d)
@@ -643,7 +786,9 @@ def _wordlist_complete(text: str) -> list[str]:
     for e in entries:
         if e.startswith(base):
             full = os.path.join(d, e) if d != "." else e
-            matches.append(full + "/" if os.path.isdir(os.path.join(d, e)) else full)
+            matches.append(
+                full + "/" if os.path.isdir(os.path.join(d, e)) else full
+            )
     return matches
 
 
@@ -682,11 +827,10 @@ readline.parse_and_bind("tab: complete")
 # ─────────────────────────────────────────────
 
 def prompt(session: Session) -> str:
-    tgt  = session.cfg.target or "-"
-    # Shorten target for display
-    tgt  = re.sub(r"https?://", "", tgt)[:30]
-    run  = C.g("●") if session.is_running() else C.dim("○")
-    return (f"{C.BOLD}{C.RED}anubis{C.END} "
+    tgt = session.cfg.target or "-"
+    tgt = re.sub(r"https?://", "", tgt)[:32]
+    run = C.g("●") if session.is_running() else C.dim("○")
+    return (f"{C.BOLD}{C.RED}Anubis{C.END} "
             f"{run} "
             f"{C.dim(f'({tgt})')} "
             f"{C.BOLD}{C.GREEN}>{C.END} ")
@@ -699,7 +843,6 @@ def prompt(session: Session) -> str:
 def run_console() -> None:
     print(BANNER)
     session = Session()
-    last_store: ResultStore | None = None
 
     while True:
         try:
@@ -759,7 +902,6 @@ def run_console() -> None:
                 val = " ".join(args[1:])
 
                 if key == "target":
-                    # Normalise URL
                     if not val.startswith(("http://", "https://")):
                         val = "http://" + val
                     session.cfg.target = val.rstrip("/")
@@ -771,13 +913,13 @@ def run_console() -> None:
                         print(C.r(f"  [-] File not found: {val}"))
                     else:
                         session.cfg.wordlist = str(p)
-                        # Count words
                         try:
-                            wc = sum(1 for l in open(p, errors="ignore")
-                                     if l.strip() and not l.startswith("#"))
+                            wc = sum(1 for ln in open(p, errors="ignore")
+                                     if ln.strip() and not ln.startswith("#"))
                         except Exception:
                             wc = "?"
-                        print(f"  {C.dim('wordlist')} => {C.g(str(p))}  {C.dim('(' + str(wc) + ' words)')}")
+                        print(f"  {C.dim('wordlist')} => {C.g(str(p))}"
+                              f"  {C.dim('(' + str(wc) + ' words)')}")
 
                 elif key == "threads":
                     try:
@@ -787,7 +929,7 @@ def run_console() -> None:
                         session.cfg.threads = n
                         print(f"  {C.dim('threads')} => {C.g(str(n))}")
                     except ValueError:
-                        print(C.r("  [-] threads must be an integer between 1 and 200"))
+                        print(C.r("  [-] threads must be between 1 and 200"))
 
                 elif key == "timeout":
                     try:
@@ -807,18 +949,23 @@ def run_console() -> None:
                         session.cfg.delay = n
                         print(f"  {C.dim('delay')} => {C.g(str(n) + 's')}")
                     except ValueError:
-                        print(C.r("  [-] delay must be a non-negative number"))
+                        print(C.r("  [-] delay must be >= 0"))
 
                 elif key == "extensions":
-                    exts = [e.strip().lstrip(".") for e in val.replace(",", " ").split() if e.strip()]
+                    exts = [e.strip().lstrip(".")
+                            for e in val.replace(",", " ").split()
+                            if e.strip()]
                     session.cfg.extensions = exts
                     print(f"  {C.dim('extensions')} => {C.g(', '.join(exts) or 'none')}")
 
                 elif key == "status":
                     try:
-                        codes = {int(c.strip()) for c in val.replace(",", " ").split() if c.strip()}
+                        codes = {int(c.strip())
+                                 for c in val.replace(",", " ").split()
+                                 if c.strip()}
                         session.cfg.status_ok = codes
-                        print(f"  {C.dim('status')} => {C.g(', '.join(str(c) for c in sorted(codes)))}")
+                        print(f"  {C.dim('status')} => "
+                              f"{C.g(', '.join(str(c) for c in sorted(codes)))}")
                     except ValueError:
                         print(C.r("  [-] status must be comma-separated HTTP codes"))
 
@@ -840,7 +987,7 @@ def run_console() -> None:
                         session.cfg.max_depth = n
                         print(f"  {C.dim('depth')} => {C.g(str(n))}")
                     except ValueError:
-                        print(C.r("  [-] depth must be an integer between 1 and 10"))
+                        print(C.r("  [-] depth must be between 1 and 10"))
 
                 elif key == "useragent":
                     session.cfg.user_agent = val
@@ -864,7 +1011,7 @@ def run_console() -> None:
             else:
                 print(C.dim("  Waiting for scan to finish... (Ctrl+C to stop)"))
                 try:
-                    session._scan_thread.join()
+                    session._scan_thread.join()  # type: ignore[union-attr]
                 except KeyboardInterrupt:
                     print()
                     session.stop_scan()
@@ -885,7 +1032,6 @@ def run_console() -> None:
 
         # ── results ───────────────────────────────────────────────────────
         elif cmd == "results":
-            # Find most recent result JSON
             if not OUTPUT_DIR.exists():
                 print(C.dim("  No results yet."))
             else:

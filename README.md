@@ -32,7 +32,7 @@
 
 Think `gobuster` or `feroxbuster`, but interactive: configure your scan in a persistent session, fire it off with `run`, and watch results stream in live while the progress bar tracks throughput and ETA.
 
-![screenshot](https://github.com/ZetaOrioniss/Anubis/blob/main/assets/example.png)
+![screenshot](https://github.com/ZetaOrioniss/anubis/blob/main/assets/example.png)
 
 ```
 Anubis ● (10.10.11.25) > run
